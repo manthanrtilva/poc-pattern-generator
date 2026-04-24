@@ -1,3 +1,5 @@
 /target
 .vercel
 .env*.local
+node_modules
+dist

@@ -1,0 +1,33 @@
+{
+  "name": "poc-pattern-generator",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c red,blue \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "cargo run --release",
+    "dev:web": "vite --host",
+    "build": "vite build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manthanrtilva/poc-pattern-generator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/manthanrtilva/poc-pattern-generator/issues"
+  },
+  "homepage": "https://github.com/manthanrtilva/poc-pattern-generator#readme",
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "vite": "^8.0.10"
+  }
+}
