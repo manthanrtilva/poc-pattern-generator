@@ -14,3 +14,7 @@ vercel_runtime = "2.2.0"
 [[bin]]
 name = "pattern-generator"
 path = "api/pattern-generator.rs"
+
+# [[bin]]
+# name = "pattern-maxicanwave"
+# path = "api/pattern-maxicanwave.rs"

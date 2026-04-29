@@ -8,6 +8,7 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState(null); // { x, y, type, index }
   const [rows, setRows] = useState([]); // each row: { items: [{ label, type, color }] }
   const [selectedBoxes, setSelectedBoxes] = useState(new Set()); // Set of "ri-i-ci" keys
+  const [version, setVersion] = useState("V0");
   const mastersRef = useRef(masters);
   const slavesRef = useRef(slaves);
   const selectedRef = useRef(selected);
@@ -102,6 +103,7 @@ export default function App() {
     const leds = rows.length > 0 ? rows[0].items.length * 8 : 0;
     const payload = {
       leds,
+      version,
       rows: rows.map((row) => ({
         colors: row.items.flatMap((item) =>
           item.colors.map((hex) => {
@@ -114,7 +116,7 @@ export default function App() {
         delay: row.value,
       })),
     };
-    fetch("/api/pattern-generator", {
+    fetch("/api/pattern-generator/build", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -130,7 +132,20 @@ export default function App() {
       })
       .catch((err) => console.error("BuildBinary error:", err));
   }
+
+
 function addRow() {
+    if (rows.length > 0) {
+      // Duplicate last row (deep copy)
+      const last = rows[rows.length - 1];
+      const cloned = {
+        items: last.items.map((it) => ({ ...it, colors: [...it.colors] })),
+        value: last.value,
+      };
+      setRows((prev) => [...prev, cloned]);
+      return;
+    }
+
     // Build ordered items by following connections
     const items = [];
     const visited = { master: new Set(), slave: new Set() };
@@ -388,7 +403,15 @@ function addRow() {
 
   return (
     <div ref={containerRef} style={{ fontFamily: "sans-serif", padding: "2rem" }} onClick={() => setContextMenu(null)}>
-      <h1>Pattern Generator</h1>
+      <a href="/">Generator</a>
+      <a href="/view" style={{ marginLeft: "0.75rem", fontSize: 14, color: "#0366d6", textDecoration: "none" }}>View</a><p/>
+      <select value={version} onChange={(e) => setVersion(e.target.value)} style={{ marginRight: "0.5rem" }}>
+        <option value="V0">V0</option>
+        <option value="V1">V1</option>
+        <option value="V2">V2</option>
+        <option value="V3">V3</option>
+        <option value="V4">V4</option>
+      </select>
       <button onClick={clearAll}>Clear</button>
       <button onClick={addMaster}>AddMaster</button>
       <button onClick={addSlave}>AddSlave</button>

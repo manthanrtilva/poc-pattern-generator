@@ -1,0 +1,11 @@
+#include <stdio.h>
+#include <stdint.h>
+const uint16_t RAINBOW_COLORS[][3] = {{0x94,0x00,0xD3}, {0x4B,0x00,0x82}, {0x00,0x00,0xFF}, {0x00,0xFF,0x00},
+                              {0xFF,0xFF,0x00}, {0xFF,0x7F,0x00}, {0xFF,0x00,0x00}};
+
+int main() {
+    uint8_t opacity = 100;
+    uint8_t b = RAINBOW_COLORS[6][0]*opacity/100;
+    printf("%02X %02X\n", RAINBOW_COLORS[6][0],b);
+    return 0;
+}
