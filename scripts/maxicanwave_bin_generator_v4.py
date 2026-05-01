@@ -202,7 +202,7 @@ def main():
     if args.leds < 1:
         raise SystemExit("leds must be >= 1")
 
-    rows = simulate_frames(args.leds, args.delay)
+    rows = simulate_frames(args.leds, args.delay, base_color=(0, 255, 0))
     palette, lookup = build_palette(rows)
     leds = args.leds
 
