@@ -1,5 +1,8 @@
 {
   "framework": "vite",
   "installCommand": "npm install",
-  "buildCommand": "vite build"
+  "buildCommand": "vite build",
+  "rewrites": [
+    { "source": "/view", "destination": "/view.html" }
+  ]
 }

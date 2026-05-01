@@ -751,18 +751,38 @@ pub async fn handler_view_v4(req: Request) -> Result<Response<ResponseBody>, Err
     let (_, body) = req.into_parts();
     let body_bytes = body.collect().await?.to_bytes();
 
-    // Expect segment binary:
-    // [4B leds][4B num_frames][4B delay][1B pal_len][pal_len*3B RGB]
-    // keyframe: [1B num_runs][runs: 1B count, 1B idx]...
-    // segments: [1B num_segments][per seg: 1B start_led, 1B repeat_count, 1B flags]
-    if body_bytes.len() < 13 {
+    if body_bytes.is_empty() {
         return Ok(Response::builder()
             .status(400)
             .header("Content-Type", "text/plain")
             .body(ResponseBody::from("invalid body"))?);
     }
 
-    let mut offset: usize = 0;
+    // Dispatch on the leading format_id byte.
+    match body_bytes[0] {
+        0 => handler_view_v4_format0(&body_bytes).await,
+        1 => handler_view_v4_format1(&body_bytes).await,
+        _ => Ok(Response::builder()
+            .status(400)
+            .header("Content-Type", "text/plain")
+            .body(ResponseBody::from("unsupported format_id"))?),
+    }
+}
+
+pub async fn handler_view_v4_format0(body_bytes: &[u8]) -> Result<Response<ResponseBody>, Error> {
+    // Expect segment binary (format_id = 0):
+    // [1B format_id (= 0)]
+    // [4B leds][4B num_frames][4B delay][1B pal_len][pal_len*3B RGB]
+    // keyframe: [1B num_runs][runs: 1B count, 1B idx]...
+    // segments: [1B num_segments][per seg: 1B start_led, 1B repeat_count, 1B flags]
+    if body_bytes.len() < 14 {
+        return Ok(Response::builder()
+            .status(400)
+            .header("Content-Type", "text/plain")
+            .body(ResponseBody::from("invalid body"))?);
+    }
+
+    let mut offset: usize = 1;
     let mut arr4: [u8; 4] = [0; 4];
 
     arr4.copy_from_slice(&body_bytes[offset..offset + 4]);
@@ -881,7 +901,151 @@ pub async fn handler_view_v4(req: Request) -> Result<Response<ResponseBody>, Err
     let resp = json!({ "leds": leds, "rows": rows });
     let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
     println!(
-        "handler_view_v4 parsed frames={}, leds={}, palette={}, segments={}",
+        "handler_view_v4_format0 parsed frames={}, leds={}, palette={}, segments={}",
+        rows.len(),
+        leds,
+        pal_len,
+        num_segments
+    );
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(ResponseBody::from(body))?)
+}
+
+pub async fn handler_view_v4_format1(body_bytes: &[u8]) -> Result<Response<ResponseBody>, Error> {
+    // Expect rotation binary (format_id = 1):
+    // [1B format_id (= 1)]
+    // [4B leds][4B num_frames][4B delay][1B pal_len][pal_len*3B RGB]
+    // keyframe: [1B num_runs][runs: 1B count, 1B idx]...
+    // segments: [1B num_segments][per seg: 1B shift (i8), 1B repeat_count]
+    if body_bytes.len() < 14 {
+        return Ok(Response::builder()
+            .status(400)
+            .header("Content-Type", "text/plain")
+            .body(ResponseBody::from("invalid body"))?);
+    }
+
+    let mut offset: usize = 1;
+    let mut arr4: [u8; 4] = [0; 4];
+
+    arr4.copy_from_slice(&body_bytes[offset..offset + 4]);
+    let leds = u32::from_be_bytes(arr4) as usize;
+    offset += 4;
+
+    arr4.copy_from_slice(&body_bytes[offset..offset + 4]);
+    let num_frames = u32::from_be_bytes(arr4) as usize;
+    offset += 4;
+
+    arr4.copy_from_slice(&body_bytes[offset..offset + 4]);
+    let delay = u32::from_be_bytes(arr4);
+    offset += 4;
+
+    let pal_len = {
+        let v = body_bytes[offset] as usize;
+        offset += 1;
+        if v == 0 { 256 } else { v }
+    };
+
+    // Read palette
+    let mut palette: Vec<u32> = Vec::with_capacity(pal_len);
+    for _ in 0..pal_len {
+        if offset + 3 > body_bytes.len() {
+            break;
+        }
+        let r = body_bytes[offset] as u32;
+        let g = body_bytes[offset + 1] as u32;
+        let b = body_bytes[offset + 2] as u32;
+        offset += 3;
+        palette.push((r << 16) | (g << 8) | b);
+    }
+
+    let mut rows: Vec<Value> = Vec::with_capacity(num_frames);
+
+    if num_frames == 0 || leds == 0 {
+        let resp = json!({ "leds": leds, "rows": rows });
+        let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+        return Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(ResponseBody::from(body))?);
+    }
+
+    // --- Decode keyframe ---
+    if offset >= body_bytes.len() {
+        return Ok(Response::builder()
+            .status(400)
+            .header("Content-Type", "text/plain")
+            .body(ResponseBody::from("invalid body"))?);
+    }
+    let num_runs = body_bytes[offset] as usize;
+    offset += 1;
+    let mut fb: Vec<u8> = Vec::with_capacity(leds);
+    for _ in 0..num_runs {
+        if offset + 2 > body_bytes.len() {
+            break;
+        }
+        let count = body_bytes[offset] as usize;
+        let idx = body_bytes[offset + 1];
+        offset += 2;
+        for _ in 0..count {
+            if fb.len() < leds {
+                fb.push(idx);
+            }
+        }
+    }
+
+    // Emit keyframe
+    let colors: Vec<Value> = fb
+        .iter()
+        .map(|&idx| Value::from(*palette.get(idx as usize).unwrap_or(&0)))
+        .collect();
+    rows.push(json!({"colors": colors, "delay": delay}));
+
+    // --- Decode rotation segments ---
+    if offset >= body_bytes.len() {
+        let resp = json!({ "leds": leds, "rows": rows });
+        let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+        return Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(ResponseBody::from(body))?);
+    }
+
+    let num_segments = body_bytes[offset] as usize;
+    offset += 1;
+
+    let n = fb.len() as i32;
+    for _ in 0..num_segments {
+        if offset + 2 > body_bytes.len() {
+            break;
+        }
+        let shift = body_bytes[offset] as i8 as i32;
+        let count = body_bytes[offset + 1] as usize;
+        offset += 2;
+
+        if n == 0 {
+            continue;
+        }
+        // Normalize shift into [0, n) — positive = rotate left.
+        let s = (((shift % n) + n) % n) as usize;
+
+        for _ in 0..count {
+            if s != 0 {
+                fb.rotate_left(s);
+            }
+            let colors: Vec<Value> = fb
+                .iter()
+                .map(|&idx| Value::from(*palette.get(idx as usize).unwrap_or(&0)))
+                .collect();
+            rows.push(json!({"colors": colors, "delay": delay}));
+        }
+    }
+
+    let resp = json!({ "leds": leds, "rows": rows });
+    let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+    println!(
+        "handler_view_v4_format1 parsed frames={}, leds={}, palette={}, segments={}",
         rows.len(),
         leds,
         pal_len,

@@ -8,6 +8,14 @@
 		"dockerfile": "Dockerfile",
 		"context": "."
 	},
+	"mounts": [
+		{
+			"source": "C:\\work\\zuru\\lightstrip",
+			"target": "/workspaces/lightstrip",
+			"type": "bind"
+		}
+	],
+	"workspaceFolder": "/workspaces/",
 
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	// "mounts": [

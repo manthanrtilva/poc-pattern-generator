@@ -10,6 +10,7 @@ This exploits the structure of the wave animation:
 
 Binary format:
   HEADER:
+    [1 byte   format_id    (u8)]       — 0 = wave (4-LED kernel segments)
     [4 bytes  leds         (u32 BE)]
     [4 bytes  num_frames   (u32 BE)]   — total frames (for decoders that need it)
     [4 bytes  delay        (u32 BE)]   — constant delay for all frames
@@ -225,6 +226,7 @@ def main():
     # Write binary
     with open(args.output, "wb") as f:
         # HEADER
+        f.write(b"\x00")  # format_id: 0 = wave
         f.write(leds.to_bytes(4, "big"))
         f.write(len(frames).to_bytes(4, "big"))
         f.write(args.delay.to_bytes(4, "big"))
