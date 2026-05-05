@@ -1,44 +1,43 @@
 #!/usr/bin/env python3
 
 """
-Generate Mexican-wave frames with segment-based compression (v4).
+Generate Mexican-wave frames with delta-frame compression (v4).
 
-This exploits the structure of the wave animation:
-  - Only 4 consecutive LEDs change per frame
-  - Palette index deltas are always ±1
-  - The "add kernel" slides across the strip in predictable segments
+Each frame is encoded as the per-LED palette-index changes vs. the previous
+frame. Globally only 4 consecutive LEDs change per frame and the deltas are
+±1, but when the strip is split into groups the global kernel may straddle a
+group boundary, so a group sees 0–4 changes per frame. The delta layout
+handles both cases uniformly.
 
-Binary format:
+Binary format (format_id = 0):
   HEADER:
-    [1 byte   format_id    (u8)]       — 0 = wave (4-LED kernel segments)
+    [1 byte   format_id    (u8)]       — 0
     [4 bytes  leds         (u32 BE)]
-    [4 bytes  num_frames   (u32 BE)]   — total frames (for decoders that need it)
+    [4 bytes  num_frames   (u32 BE)]
     [4 bytes  delay        (u32 BE)]   — constant delay for all frames
     [1 byte   palette_len  (u8)]       — 0 means 256
     [palette_len * 3 bytes]            — palette RGB entries
 
-  KEYFRAME:
+  KEYFRAME (RLE of palette indices):
     [1 byte  num_runs]
     for each run:
         [1 byte  run_length (1-255)]
         [1 byte  palette_index]
 
-  SEGMENTS:
-    [1 byte  num_segments]
-    for each segment:
-        [1 byte  start_led]       — first LED index of the 4-LED kernel
-        [1 byte  repeat_count]    — how many frames this segment lasts
-        [1 byte  flags]           — bit 0: sign pattern (0 = -1,-1,+1,+1  1 = +1,+1,-1,-1)
+  DELTA FRAMES (RLE'd):
+    [4 bytes  num_delta_frames (u32 BE)]   — = num_frames - 1
+    [4 bytes  num_runs         (u32 BE)]
+    for each run:
+        [1 byte  repeat (1-255)]                — apply this delta `repeat` times
+        [1 byte  num_changes (0-255)]
+        for each change:
+            [1 byte  led_idx (0..leds-1)]
+            [1 byte  delta   (i8, typically ±1)]
 
 MCU decoder:
-  1. Load palette and keyframe into framebuffer (palette indices).
-  2. For each segment, repeat `repeat_count` times:
-     - Apply the 4-pixel kernel at `start_led` with the given sign pattern:
-       fb[start_led+0] += sign[0]   (i.e. ±1 to palette index)
-       fb[start_led+1] += sign[1]
-       fb[start_led+2] += sign[2]
-       fb[start_led+3] += sign[3]
-     - Render framebuffer using palette lookup, wait `delay` ms.
+  1. Load palette + keyframe into framebuffer (palette indices).
+  2. For each run, repeat `repeat` times: apply the change list (fb[led] += d),
+     render via palette lookup, wait `delay` ms.
 """
 
 import argparse
@@ -150,105 +149,128 @@ def rle_encode_indices(indices):
     return bytes(encoded), num_runs
 
 
-def build_segments(frames, leds):
-    """Analyse delta frames and return list of (start_led, repeat_count, flags).
+def write_pattern(path, group_leds, group_frames, palette, delay):
+    """Write a delta-frame compressed file (format_id = 0).
 
-    flags bit 0: 0 = kernel (-1,-1,+1,+1), 1 = kernel (+1,+1,-1,-1)
+    Delta records are RLE-compressed: consecutive frames whose change-set is
+    identical are stored once with a repeat count. This is highly effective
+    for the wave pattern, where the same ±1 kernel is applied to the same
+    LEDs for many frames between kernel rotations.
     """
-    SIGN_FWD = (-1, -1, 1, 1)
-    SIGN_BWD = (1, 1, -1, -1)
-
-    prev = frames[0]
-    segments = []
-    cur_key = None   # (start_led, flags)
-    cur_count = 0
-
-    for f in frames[1:]:
-        positions = [j for j in range(leds) if f[j] != prev[j]]
-        if len(positions) == 4 and positions == list(range(positions[0], positions[0] + 4)):
-            signs = tuple(1 if f[j] > prev[j] else -1 for j in positions)
-            start = positions[0]
-            if signs == SIGN_FWD:
-                flags = 0
-            elif signs == SIGN_BWD:
-                flags = 1
-            else:
-                raise ValueError(f"Unexpected sign pattern: {signs}")
-            key = (start, flags)
-            if key == cur_key and cur_count < 255:
-                cur_count += 1
-            else:
-                if cur_key is not None:
-                    segments.append((cur_key[0], cur_count, cur_key[1]))
-                cur_key = key
-                cur_count = 1
-        else:
-            # Fallback: shouldn't happen for Mexican wave
-            raise ValueError(f"Non-4-consecutive delta at positions {positions}")
-        prev = f
-
-    if cur_key is not None:
-        segments.append((cur_key[0], cur_count, cur_key[1]))
-
-    return segments
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate Mexican wave segment-compressed binary (v4).")
-    parser.add_argument("--leds", "-l", type=int, default=8, help="Number of LEDs")
-    parser.add_argument("--delay", "-d", type=int, default=1000, help="Delay per frame (ms)")
-    parser.add_argument("--output", "-o", type=str, default="maxican_wave_v4.bin", help="Output file")
-    args = parser.parse_args()
-
-    if args.leds < 1:
-        raise SystemExit("leds must be >= 1")
-
-    rows = simulate_frames(args.leds, args.delay, base_color=(0, 255, 0))
-    palette, lookup = build_palette(rows)
-    leds = args.leds
-
-    # Convert to palette-index frames
-    frames = [[lookup[c] for c in row["a"]] for row in rows]
-    segments = build_segments(frames, leds)
-
-    # Verify: replay segments and compare to original frames
-    fb = list(frames[0])
-    frame_idx = 1
-    for start, count, flags in segments:
-        kernel = [-1, -1, 1, 1] if flags == 0 else [1, 1, -1, -1]
-        for _ in range(count):
-            for k in range(4):
-                fb[start + k] += kernel[k]
-            assert fb == frames[frame_idx], f"Mismatch at frame {frame_idx}"
-            frame_idx += 1
-    assert frame_idx == len(frames), f"Frame count mismatch: {frame_idx} vs {len(frames)}"
-
-    # Write binary
-    with open(args.output, "wb") as f:
-        # HEADER
-        f.write(b"\x00")  # format_id: 0 = wave
-        f.write(leds.to_bytes(4, "big"))
-        f.write(len(frames).to_bytes(4, "big"))
-        f.write(args.delay.to_bytes(4, "big"))
+    with open(path, "wb") as f:
+        f.write(b"\x00")
+        f.write(group_leds.to_bytes(4, "big"))
+        f.write(len(group_frames).to_bytes(4, "big"))
+        f.write(delay.to_bytes(4, "big"))
         pal_len = len(palette) if len(palette) < 256 else 0
         f.write(pal_len.to_bytes(1, "big"))
         for r, g, b in palette:
             f.write(bytes([r, g, b]))
 
-        # KEYFRAME (RLE of palette indices)
-        rle_bytes, num_runs = rle_encode_indices(frames[0])
+        rle_bytes, num_runs = rle_encode_indices(group_frames[0])
         f.write(num_runs.to_bytes(1, "big"))
         f.write(rle_bytes)
 
-        # SEGMENTS
-        f.write(len(segments).to_bytes(1, "big"))
-        for start, count, flags in segments:
-            f.write(bytes([start, count, flags]))
+        # Compute per-frame change-sets
+        all_changes = []
+        prev = group_frames[0]
+        for cur in group_frames[1:]:
+            changes = tuple(
+                (j, cur[j] - prev[j]) for j in range(group_leds) if cur[j] != prev[j]
+            )
+            if len(changes) > 255:
+                raise ValueError(f"Too many changes in one frame: {len(changes)}")
+            all_changes.append(changes)
+            prev = cur
 
-    size = os.path.getsize(args.output)
-    print(f"Wrote {args.output} ({size} bytes, {size/1024:.1f} KB)")
-    print(f"  {len(frames)} frames, {len(palette)} palette entries, {len(segments)} segments")
-    print(f"  Verification: OK")
+        # RLE-collapse identical consecutive change-sets (cap repeat at 255)
+        runs = []  # list of (repeat, changes)
+        for ch in all_changes:
+            if runs and runs[-1][1] == ch and runs[-1][0] < 255:
+                runs[-1] = (runs[-1][0] + 1, ch)
+            else:
+                runs.append((1, ch))
+
+        num_delta = len(all_changes)
+        f.write(num_delta.to_bytes(4, "big"))
+        f.write(len(runs).to_bytes(4, "big"))
+        for repeat, changes in runs:
+            f.write(repeat.to_bytes(1, "big"))
+            f.write(len(changes).to_bytes(1, "big"))
+            for j, d in changes:
+                f.write(j.to_bytes(1, "big"))
+                f.write(int(d).to_bytes(1, "big", signed=True))
+
+    return os.path.getsize(path), len(runs)
+
+
+def parse_groups(spec, total_leds):
+    """Parse --groups: an int N (split into N equal groups) or a comma-separated
+    list of explicit group sizes (e.g. "24,8"). Each group size must be a
+    positive multiple of 8, and the sizes must sum to total_leds."""
+    spec = spec.strip()
+    if "," in spec:
+        sizes = [int(x) for x in spec.split(",") if x.strip()]
+    else:
+        n = int(spec)
+        if n < 1:
+            raise SystemExit("groups must be >= 1")
+        if total_leds % n != 0:
+            raise SystemExit(f"leds ({total_leds}) must be divisible by groups ({n})")
+        sizes = [total_leds // n] * n
+
+    for s in sizes:
+        if s < 1:
+            raise SystemExit(f"group size must be >= 1 (got {s})")
+        # if s % 8 != 0:
+        #     raise SystemExit(f"group size must be a multiple of 8 (got {s})")
+    if sum(sizes) != total_leds:
+        raise SystemExit(f"group sizes {sizes} sum to {sum(sizes)}, expected {total_leds}")
+    return sizes
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate Mexican wave delta-compressed binary (v4).")
+    parser.add_argument("--leds", "-l", type=int, default=8, help="Total number of LEDs across all groups")
+    parser.add_argument("--delay", "-d", type=int, default=1000, help="Delay per frame (ms)")
+    parser.add_argument("--output", "-o", type=str, default="maxican_wave_v4.bin",
+                        help="Output file (single-group) or base name (multi-group, gets -gN suffix)")
+    parser.add_argument("--groups", "-g", type=str, default="1",
+                        help="Either an integer N (split into N equal groups) or a "
+                             "comma-separated list of group sizes (e.g. '24,8'). "
+                             "Each group size must be a multiple of 8.")
+    args = parser.parse_args()
+
+    if args.leds < 1:
+        raise SystemExit("leds must be >= 1")
+
+    group_sizes = parse_groups(args.groups, args.leds)
+
+    rows = simulate_frames(args.leds, args.delay, base_color=(0, 255, 0))
+    palette, lookup = build_palette(rows)
+    frames = [[lookup[c] for c in row["a"]] for row in rows]
+
+    if len(group_sizes) == 1:
+        print("frames",frames)
+        print("palette",palette)
+        size, num_runs = write_pattern(args.output, args.leds, frames, palette, args.delay)
+        print(f"Wrote {args.output} ({size} bytes, {size/1024:.1f} KB)")
+        print(f"  {len(frames)} frames, {len(palette)} palette entries, {num_runs} delta runs")
+        return
+
+    base, ext = os.path.splitext(args.output)
+    if not ext:
+        ext = ".bin"
+
+    print(f"Splitting {args.leds} LEDs into {len(group_sizes)} groups: {group_sizes}")
+    lo = 0
+    for g, gs in enumerate(group_sizes):
+        hi = lo + gs
+        group_frames = [frame[lo:hi] for frame in frames]
+        path = f"{base}-g{g}{ext}"
+        size, num_runs = write_pattern(path, gs, group_frames, palette, args.delay)
+        print(f"  group {g} (leds {lo}..{hi-1}, size {gs}): wrote {path} ({size} bytes, {num_runs} runs)")
+        lo = hi
 
 
 if __name__ == "__main__":

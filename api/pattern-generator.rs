@@ -770,11 +770,12 @@ pub async fn handler_view_v4(req: Request) -> Result<Response<ResponseBody>, Err
 }
 
 pub async fn handler_view_v4_format0(body_bytes: &[u8]) -> Result<Response<ResponseBody>, Error> {
-    // Expect segment binary (format_id = 0):
+    // Expect delta-frame binary (format_id = 0):
     // [1B format_id (= 0)]
     // [4B leds][4B num_frames][4B delay][1B pal_len][pal_len*3B RGB]
     // keyframe: [1B num_runs][runs: 1B count, 1B idx]...
-    // segments: [1B num_segments][per seg: 1B start_led, 1B repeat_count, 1B flags]
+    // [4B num_delta_frames]
+    // per frame: [1B n][n*(1B led_idx, 1B i8 delta)]
     if body_bytes.len() < 14 {
         return Ok(Response::builder()
             .status(400)
@@ -848,14 +849,12 @@ pub async fn handler_view_v4_format0(body_bytes: &[u8]) -> Result<Response<Respo
     // Emit keyframe
     let colors: Vec<Value> = fb
         .iter()
-        .map(|&idx| Value::from(*palette.get(idx as usize).unwrap_or(&0)))
+        .map(|&idx| Value::from(*palette.get(idx.max(0) as usize).unwrap_or(&0)))
         .collect();
     rows.push(json!({"colors": colors, "delay": delay}));
 
-    // --- Decode segments ---
-    let kernels: [[i16; 4]; 2] = [[-1, -1, 1, 1], [1, 1, -1, -1]];
-
-    if offset >= body_bytes.len() {
+    // --- Decode delta frames (RLE'd runs) ---
+    if offset + 8 > body_bytes.len() {
         let resp = json!({ "leds": leds, "rows": rows });
         let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
         return Ok(Response::builder()
@@ -863,49 +862,58 @@ pub async fn handler_view_v4_format0(body_bytes: &[u8]) -> Result<Response<Respo
             .header("Content-Type", "application/json")
             .body(ResponseBody::from(body))?);
     }
+    arr4.copy_from_slice(&body_bytes[offset..offset + 4]);
+    let num_delta = u32::from_be_bytes(arr4) as usize;
+    offset += 4;
+    arr4.copy_from_slice(&body_bytes[offset..offset + 4]);
+    let num_runs_total = u32::from_be_bytes(arr4) as usize;
+    offset += 4;
 
-    let num_segments = body_bytes[offset] as usize;
-    offset += 1;
-
-    for _ in 0..num_segments {
-        if offset + 3 > body_bytes.len() {
+    let mut emitted = 0usize;
+    for _ in 0..num_runs_total {
+        if offset + 2 > body_bytes.len() {
             break;
         }
-        let start = body_bytes[offset] as usize;
-        let count = body_bytes[offset + 1] as usize;
-        let flags = body_bytes[offset + 2] as usize;
-        offset += 3;
+        let repeat = body_bytes[offset] as usize;
+        let n = body_bytes[offset + 1] as usize;
+        offset += 2;
+        if offset + n * 2 > body_bytes.len() {
+            break;
+        }
+        let records_start = offset;
+        offset += n * 2;
 
-        let kernel = if flags < kernels.len() {
-            kernels[flags]
-        } else {
-            kernels[0]
-        };
-
-        for _ in 0..count {
-            for k in 0..4 {
-                if start + k < fb.len() {
-                    fb[start + k] += kernel[k];
+        for _ in 0..repeat {
+            for k in 0..n {
+                let led_idx = body_bytes[records_start + k * 2] as usize;
+                let d = body_bytes[records_start + k * 2 + 1] as i8 as i16;
+                if led_idx < fb.len() {
+                    fb[led_idx] += d;
                 }
             }
             let colors: Vec<Value> = fb
                 .iter()
-                .map(|&idx| {
-                    Value::from(*palette.get(idx.max(0) as usize).unwrap_or(&0))
-                })
+                .map(|&idx| Value::from(*palette.get(idx.max(0) as usize).unwrap_or(&0)))
                 .collect();
             rows.push(json!({"colors": colors, "delay": delay}));
+            emitted += 1;
+            if emitted >= num_delta {
+                break;
+            }
+        }
+        if emitted >= num_delta {
+            break;
         }
     }
 
     let resp = json!({ "leds": leds, "rows": rows });
     let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
     println!(
-        "handler_view_v4_format0 parsed frames={}, leds={}, palette={}, segments={}",
+        "handler_view_v4_format0 parsed frames={}, leds={}, palette={}, runs={}",
         rows.len(),
         leds,
         pal_len,
-        num_segments
+        num_runs_total
     );
     Ok(Response::builder()
         .status(200)
@@ -914,12 +922,13 @@ pub async fn handler_view_v4_format0(body_bytes: &[u8]) -> Result<Response<Respo
 }
 
 pub async fn handler_view_v4_format1(body_bytes: &[u8]) -> Result<Response<ResponseBody>, Error> {
-    // Expect rotation binary (format_id = 1):
+    // Expect palette-period synth binary (format_id = 1):
     // [1B format_id (= 1)]
-    // [4B leds][4B num_frames][4B delay][1B pal_len][pal_len*3B RGB]
-    // keyframe: [1B num_runs][runs: 1B count, 1B idx]...
-    // segments: [1B num_segments][per seg: 1B shift (i8), 1B repeat_count]
-    if body_bytes.len() < 14 {
+    // [4B leds (u32 BE)][4B num_frames (u32 BE)][4B delay (u32 BE)]
+    // [1B period][period*3B RGB palette]
+    //
+    // Decoder: frame f, led i -> palette[((i - f) mod period + period) mod period]
+    if body_bytes.len() < 1 + 4 + 4 + 4 + 1 {
         return Ok(Response::builder()
             .status(400)
             .header("Content-Type", "text/plain")
@@ -941,18 +950,19 @@ pub async fn handler_view_v4_format1(body_bytes: &[u8]) -> Result<Response<Respo
     let delay = u32::from_be_bytes(arr4);
     offset += 4;
 
-    let pal_len = {
-        let v = body_bytes[offset] as usize;
-        offset += 1;
-        if v == 0 { 256 } else { v }
-    };
+    let period = body_bytes[offset] as usize;
+    offset += 1;
 
-    // Read palette
-    let mut palette: Vec<u32> = Vec::with_capacity(pal_len);
-    for _ in 0..pal_len {
-        if offset + 3 > body_bytes.len() {
-            break;
-        }
+    if period == 0 || offset + period * 3 > body_bytes.len() {
+        return Ok(Response::builder()
+            .status(400)
+            .header("Content-Type", "text/plain")
+            .body(ResponseBody::from("invalid palette"))?);
+    }
+
+    // Read palette as packed 0xRRGGBB u32 values
+    let mut palette: Vec<u32> = Vec::with_capacity(period);
+    for _ in 0..period {
         let r = body_bytes[offset] as u32;
         let g = body_bytes[offset + 1] as u32;
         let b = body_bytes[offset + 2] as u32;
@@ -960,96 +970,26 @@ pub async fn handler_view_v4_format1(body_bytes: &[u8]) -> Result<Response<Respo
         palette.push((r << 16) | (g << 8) | b);
     }
 
+    // Synthesise frames
     let mut rows: Vec<Value> = Vec::with_capacity(num_frames);
-
-    if num_frames == 0 || leds == 0 {
-        let resp = json!({ "leds": leds, "rows": rows });
-        let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
-        return Ok(Response::builder()
-            .status(200)
-            .header("Content-Type", "application/json")
-            .body(ResponseBody::from(body))?);
-    }
-
-    // --- Decode keyframe ---
-    if offset >= body_bytes.len() {
-        return Ok(Response::builder()
-            .status(400)
-            .header("Content-Type", "text/plain")
-            .body(ResponseBody::from("invalid body"))?);
-    }
-    let num_runs = body_bytes[offset] as usize;
-    offset += 1;
-    let mut fb: Vec<u8> = Vec::with_capacity(leds);
-    for _ in 0..num_runs {
-        if offset + 2 > body_bytes.len() {
-            break;
+    let p = period as i32;
+    for f in 0..num_frames {
+        let f_i = f as i32;
+        let mut colors: Vec<Value> = Vec::with_capacity(leds);
+        for i in 0..leds {
+            let idx = (((i as i32 - f_i) % p) + p) % p;
+            colors.push(Value::from(palette[idx as usize]));
         }
-        let count = body_bytes[offset] as usize;
-        let idx = body_bytes[offset + 1];
-        offset += 2;
-        for _ in 0..count {
-            if fb.len() < leds {
-                fb.push(idx);
-            }
-        }
-    }
-
-    // Emit keyframe
-    let colors: Vec<Value> = fb
-        .iter()
-        .map(|&idx| Value::from(*palette.get(idx as usize).unwrap_or(&0)))
-        .collect();
-    rows.push(json!({"colors": colors, "delay": delay}));
-
-    // --- Decode rotation segments ---
-    if offset >= body_bytes.len() {
-        let resp = json!({ "leds": leds, "rows": rows });
-        let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
-        return Ok(Response::builder()
-            .status(200)
-            .header("Content-Type", "application/json")
-            .body(ResponseBody::from(body))?);
-    }
-
-    let num_segments = body_bytes[offset] as usize;
-    offset += 1;
-
-    let n = fb.len() as i32;
-    for _ in 0..num_segments {
-        if offset + 2 > body_bytes.len() {
-            break;
-        }
-        let shift = body_bytes[offset] as i8 as i32;
-        let count = body_bytes[offset + 1] as usize;
-        offset += 2;
-
-        if n == 0 {
-            continue;
-        }
-        // Normalize shift into [0, n) — positive = rotate left.
-        let s = (((shift % n) + n) % n) as usize;
-
-        for _ in 0..count {
-            if s != 0 {
-                fb.rotate_left(s);
-            }
-            let colors: Vec<Value> = fb
-                .iter()
-                .map(|&idx| Value::from(*palette.get(idx as usize).unwrap_or(&0)))
-                .collect();
-            rows.push(json!({"colors": colors, "delay": delay}));
-        }
+        rows.push(json!({"colors": colors, "delay": delay}));
     }
 
     let resp = json!({ "leds": leds, "rows": rows });
     let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
     println!(
-        "handler_view_v4_format1 parsed frames={}, leds={}, palette={}, segments={}",
+        "handler_view_v4_format1 parsed frames={}, leds={}, period={}",
         rows.len(),
         leds,
-        pal_len,
-        num_segments
+        period
     );
     Ok(Response::builder()
         .status(200)
